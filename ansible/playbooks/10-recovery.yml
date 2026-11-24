@@ -1,0 +1,210 @@
+---
+# Recovery de nó com systemd PID 1 congelado (SIGABRT).
+# Caso real descrito em docs/04-incidente.md.
+#
+# Ordem obrigatória — nunca tudo de uma vez:
+#   evidencia → drain → reboot → wait → update? → crashreboot → active → valida
+#
+# Todas as fases usam tags: [never]. Nada roda por acidente: cada fase é
+# selecionada explicitamente.
+#
+# Uso:
+#   ansible-playbook playbooks/10-recovery.yml -e target_host=us-02 --tags evidencia
+#   ansible-playbook playbooks/10-recovery.yml --tags drain
+#   ansible-playbook playbooks/10-recovery.yml -e target_host=us-02 --tags reboot
+#   ansible-playbook playbooks/10-recovery.yml --tags valida
+#
+# Rollback: console/KVM do provedor. O core dump é preservado na fase evidencia.
+
+- name: "FASE 0 — Preservar evidências (core dump + journal)"
+  hosts: "{{ target_host | default('us-02') }}"
+  gather_facts: false
+  tags: [evidencia, never]
+
+  vars:
+    evidence_dir: "{{ playbook_dir }}/../relatorios/evidencias/{{ target_host | default('us-02') }}-core"
+
+  tasks:
+    - name: Criar diretório local de evidências
+      ansible.builtin.file:
+        path: "{{ evidence_dir }}"
+        state: directory
+        mode: "0700"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Localizar core dump
+      ansible.builtin.stat:
+        path: /core
+      register: core_dump
+
+    - name: Falhar cedo se o core dump sumiu
+      ansible.builtin.fail:
+        msg: "Core dump /core ausente — não prossiga com o reboot sem a evidência."
+      when: not core_dump.stat.exists
+
+    - name: Baixar core dump para o repositório (evidências)
+      ansible.builtin.fetch:
+        src: /core
+        dest: "{{ evidence_dir }}/"
+        flat: true
+
+    - name: Exportar últimas linhas do journal anterior ao boot
+      ansible.builtin.shell:
+        cmd: journalctl -b -1 --no-pager | tail -200 > /root/evidencia-journal.txt || true
+      changed_when: false
+
+    - name: Baixar journal
+      ansible.builtin.fetch:
+        src: /root/evidencia-journal.txt
+        dest: "{{ evidence_dir }}/"
+        flat: true
+
+- name: "FASE 1 — Drain do nó no Swarm (no manager)"
+  hosts: swarm_manager
+  gather_facts: false
+  tags: [drain, never]
+
+  vars:
+    swarm_node_name: "{{ target_host | default('us-02') }}"
+
+  tasks:
+    - name: Drenar o nó (encerra o retry storm do scheduler)
+      ansible.builtin.command:
+        cmd: docker node update --availability drain {{ swarm_node_name }}
+      changed_when: true
+
+    - name: Confirmar estado Drain
+      ansible.builtin.command:
+        cmd: docker node ls --filter name={{ swarm_node_name }} --format '{{ '{{' }}.Hostname}}\t{{ '{{' }}.Status}}\t{{ '{{' }}.Availability}}'
+      register: node_ls
+      changed_when: false
+
+    - name: Exibir estado do nó
+      ansible.builtin.debug:
+        var: node_ls.stdout_lines
+
+- name: "FASE 2 — Reboot via Magic SysRq (systemctl inoperante com PID 1 travado)"
+  hosts: "{{ target_host | default('us-02') }}"
+  gather_facts: false
+  tags: [reboot, never]
+
+  tasks:
+    - name: Sincronizar discos, remontar read-only e reiniciar (s/u/b)
+      ansible.builtin.shell:
+        cmd: |
+          echo s > /proc/sysrq-trigger
+          sleep 2
+          echo u > /proc/sysrq-trigger
+          sleep 2
+          echo b > /proc/sysrq-trigger
+      ignore_errors: true
+      changed_when: true
+
+- name: "FASE 3 — Aguardar retorno da conexão"
+  hosts: "{{ target_host | default('us-02') }}"
+  gather_facts: false
+  tags: [wait, reboot, never]
+
+  tasks:
+    - name: Esperar SSH voltar após o reboot (~600s)
+      ansible.builtin.wait_for_connection:
+        timeout: 600
+        delay: 30
+
+- name: "FASE 4 — Update do sistema (OPT-IN, exige janela aprovada)"
+  hosts: "{{ target_host | default('us-02') }}"
+  gather_facts: false
+  tags: [update, never]
+
+  tasks:
+    - name: Atualizar pacotes de segurança e userspace
+      ansible.builtin.apt:
+        upgrade: safe
+        update_cache: true
+        autoremove: true
+
+- name: "FASE 5 — Prevenção P1: CrashReboot=yes"
+  hosts: "{{ target_host | default('us-02') }}"
+  gather_facts: false
+  tags: [crashreboot, never]
+
+  tasks:
+    - name: Configurar reboot automático em crash do PID 1
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system.conf
+        regexp: '^#?CrashReboot='
+        line: 'CrashReboot=yes'
+        backup: true
+      notify: Reload systemd config
+
+  handlers:
+    - name: Reload systemd config
+      ansible.builtin.command:
+        cmd: systemctl daemon-reload
+      # pode falhar se o PID 1 ainda estiver instável neste momento
+      ignore_errors: true
+
+- name: "FASE 6 — Reativar o nó no Swarm (drain é permanente até reativar)"
+  hosts: swarm_manager
+  gather_facts: false
+  tags: [active, never]
+
+  vars:
+    swarm_node_name: "{{ target_host | default('us-02') }}"
+
+  tasks:
+    - name: Reativar o nó
+      ansible.builtin.command:
+        cmd: docker node update --availability active {{ swarm_node_name }}
+      changed_when: true
+
+- name: "FASE 7 — Validação local"
+  hosts: "{{ target_host | default('us-02') }}"
+  gather_facts: false
+  tags: [valida, never]
+
+  vars:
+    # porta de um serviço binário (não use curl — protocolo proprietário)
+    app_port: 9000
+
+  tasks:
+    - name: Estado do systemd
+      ansible.builtin.command:
+        cmd: systemctl is-system-running
+      register: systemd_state
+      changed_when: false
+
+    - name: Porta do serviço de alertas aberta
+      ansible.builtin.command:
+        cmd: nc -vz -w 5 localhost {{ app_port }}
+      register: porta_alerta
+      changed_when: false
+      failed_when: "'open' not in porta_alerta.stderr"
+
+    - name: Falhar se systemd não estiver running
+      ansible.builtin.fail:
+        msg: "systemd = {{ systemd_state.stdout }} — investigar via console/KVM."
+      when: systemd_state.stdout != 'running'
+
+    - name: Resumo da validação local
+      ansible.builtin.debug:
+        msg:
+          - "systemctl is-system-running = {{ systemd_state.stdout }}"
+          - "nc localhost {{ app_port }} = {{ porta_alerta.stderr }}"
+
+- name: "FASE 7b — Validação no manager (réplicas)"
+  hosts: swarm_manager
+  gather_facts: false
+  tags: [valida, never]
+
+  tasks:
+    - name: Listar services e réplicas
+      ansible.builtin.command:
+        cmd: docker service ls
+      register: services
+      changed_when: false
+
+    - name: "Exibir services (esperado: réplicas 1/1)"
+      ansible.builtin.debug:
+        var: services.stdout_lines

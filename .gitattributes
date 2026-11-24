@@ -1,0 +1,9 @@
+# Normaliza texto para LF no repositório (evita diffs por CRLF no Windows)
+* text=auto eol=lf
+
+*.ps1 text eol=crlf
+*.png binary
+*.jpg binary
+*.gif binary
+*.ico binary
+*.pdf binary

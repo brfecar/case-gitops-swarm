@@ -1,0 +1,89 @@
+# Matriz de portas — EXEMPLO
+#
+# Esta matriz é a fonte da verdade do firewall. O gerador render_ufw.py lê este
+# arquivo e imprime os comandos `ufw`; nada é aplicado automaticamente.
+#
+# Regra de revisão: toda porta publicada precisa de uma linha aqui OU de uma
+# justificativa documentada no mesmo commit.
+#
+# As portas abaixo são inventadas. Não correspondem a nenhum ambiente real.
+
+metadata:
+  versao: 1
+  atualizado: "2026-08-20"
+  observacao: "exemplo didático — não usar em produção sem revisão"
+
+regras:
+  # --- Recepção de telemetria (pública por natureza) ---
+  - porta: 5001
+    proto: tcp
+    servico: gateway-recepcao-01
+    origem: any
+    acao: allow
+    comentario: "recepcao publica - gateway 01"
+
+  - porta: 5002
+    proto: udp
+    servico: gateway-recepcao-02
+    origem: any
+    acao: allow
+    comentario: "recepcao publica - gateway 02"
+
+  - porta: 5003
+    proto: tcp
+    servico: gateway-recepcao-03
+    origem: any
+    acao: allow
+    comentario: "recepcao publica - gateway 03"
+
+  # --- Serviços internos: só a origem autorizada ---
+  - porta: 5432
+    proto: tcp
+    servico: postgres
+    origem: 198.51.100.0/24
+    acao: allow
+    comentario: "banco - somente rede de aplicacao"
+
+  - porta: 9090
+    proto: tcp
+    servico: prometheus
+    origem: 192.0.2.0/24
+    acao: allow
+    comentario: "metricas - somente rede de observabilidade"
+
+  - porta: 3100
+    proto: tcp
+    servico: loki
+    origem: 192.0.2.0/24
+    acao: allow
+    comentario: "logs - somente rede de observabilidade"
+
+  # --- Swarm: comunicação entre nós (nunca exposta à internet) ---
+  - porta: 2377
+    proto: tcp
+    servico: swarm-manager
+    origem: 192.0.2.0/24
+    acao: allow
+    comentario: "swarm gerencia"
+
+  - porta: 7946
+    proto: tcp
+    servico: swarm-discovery
+    origem: 192.0.2.0/24
+    acao: allow
+    comentario: "swarm descoberta tcp"
+
+  - porta: 4789
+    proto: udp
+    servico: swarm-vxlan
+    origem: 192.0.2.0/24
+    acao: allow
+    comentario: "swarm overlay vxlan"
+
+  # --- Exemplo de bloqueio explícito ---
+  - porta: 27017
+    proto: tcp
+    servico: mongodb
+    origem: any
+    acao: deny
+    comentario: "banco auxiliar nunca exposto publicamente"

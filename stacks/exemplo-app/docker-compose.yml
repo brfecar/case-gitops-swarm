@@ -1,0 +1,134 @@
+# Stack de exemplo — padrão usado no cluster.
+#
+# Pontos que este arquivo demonstra:
+#   - imagem com tag explícita (nunca `latest` em produção)
+#   - healthcheck real (o orquestrador precisa saber o que é "saudável")
+#   - deploy com réplicas, update_config e rollback_config
+#   - limites de recurso (sem limite, um container faminto derruba o nó)
+#   - rotação de log (json-file sem limite enche o disco)
+#   - segredo via Docker Secret (nunca em variável de ambiente no compose)
+#   - placement constraint para não concentrar réplicas no mesmo nó
+#
+# Deploy:
+#   docker stack deploy -c stacks/exemplo-app/docker-compose.yml exemplo
+
+version: "3.8"
+
+services:
+  web:
+    image: nginx:1.27-alpine
+    ports:
+      - target: 80
+        published: 8080
+        protocol: tcp
+        mode: ingress
+    environment:
+      APP_ENV: production
+      APP_UPSTREAM: http://app:3000
+    secrets:
+      - source: app_token
+        target: app_token
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+    deploy:
+      replicas: 2
+      update_config:
+        order: start-first
+        parallelism: 1
+        delay: 10s
+        failure_action: rollback
+      rollback_config:
+        order: stop-first
+        parallelism: 1
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 3
+        window: 120s
+      placement:
+        max_replicas_per_node: 1
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+        reservations:
+          cpus: "0.10"
+          memory: 64M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - app-net
+
+  app:
+    image: nginx:1.27-alpine
+    environment:
+      PORT: "3000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3000/healthz"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+    deploy:
+      replicas: 2
+      update_config:
+        order: start-first
+        failure_action: rollback
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "1.00"
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - app-net
+
+  cache:
+    image: redis:7.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - cache-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    deploy:
+      replicas: 1
+      placement:
+        constraints:
+          - node.role == worker
+      resources:
+        limits:
+          cpus: "0.50"
+          memory: 256M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    networks:
+      - app-net
+
+networks:
+  app-net:
+    driver: overlay
+    attachable: false
+
+volumes:
+  cache-data:
+
+secrets:
+  app_token:
+    external: true

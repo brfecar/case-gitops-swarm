@@ -1,0 +1,24 @@
+flowchart TD
+    dev["Mudança<br/>(stack, firewall, baseline)"]
+    repo["Repositório Git<br/>fonte da verdade"]
+    review["Revisão<br/>diff + classificação de risco"]
+    deploy["Deploy<br/>docker stack deploy / ansible-playbook"]
+    verify["Verificação<br/>logs, métricas, estado do cluster"]
+    doc["Documentação atualizada<br/>no mesmo commit"]
+
+    dev --> repo
+    repo --> review
+    review -->|aprovado| deploy
+    review -->|rejeitado| dev
+    deploy --> verify
+    verify -->|ok| doc
+    verify -->|falhou| rollback["Rollback<br/>git revert + redeploy"]
+    rollback --> repo
+    doc --> repo
+
+    classDef git fill:#1f6feb,color:#fff
+    classDef check fill:#238636,color:#fff
+    classDef fail fill:#da3633,color:#fff
+    class repo,doc git
+    class verify check
+    class rollback fail

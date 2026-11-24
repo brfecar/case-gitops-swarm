@@ -1,0 +1,326 @@
+---
+# Auditoria completa: sistema, Docker, containers, redes, volumes, Swarm e pacotes.
+#
+# Saída:
+#   relatorios/servidor-<host>.txt   (um por host)
+#   relatorios/swarm-topologia.txt   (somente no manager)
+#
+# Uso:
+#   cp inventory.example.ini inventory.ini
+#   ansible all -m ping
+#   ansible-playbook playbooks/00-auditoria.yml
+#
+# Leia docs/03-execucao.md para as armadilhas de Jinja2 × Go template.
+
+# =====================================================
+# PLAY 1 — Coleta completa (todos os hosts)
+# =====================================================
+- name: Coleta completa por host
+  hosts: servers
+  gather_facts: true
+
+  tasks:
+    - name: Criar diretório local de relatórios
+      ansible.builtin.file:
+        path: "{{ playbook_dir }}/../relatorios"
+        state: directory
+        mode: "0750"
+      delegate_to: localhost
+      run_once: true
+
+    - name: Coletar inventário de pacotes
+      ansible.builtin.package_facts:
+        manager: apt
+      register: pacotes
+
+    - name: Determinar região a partir do grupo do inventário
+      ansible.builtin.set_fact:
+        regiao: >-
+          {{ 'América do Sul' if 'br' in group_names
+             else ('América do Norte' if 'us' in group_names
+             else 'Europa') }}
+
+    # --- Detecção de Docker ---
+    - name: Verificar se Docker está instalado
+      ansible.builtin.command: docker --version
+      register: docker_version
+      ignore_errors: true
+      changed_when: false
+
+    - name: Coletar informações detalhadas do Docker
+      ansible.builtin.command: docker info --format '{{ '{{' }}json .{{ '}}' }}'
+      register: docker_info_json
+      when: docker_version.rc == 0
+      changed_when: false
+
+    - name: Interpretar o JSON do Docker
+      ansible.builtin.set_fact:
+        docker_info: "{{ docker_info_json.stdout | from_json }}"
+      when: docker_version.rc == 0
+
+    # --- Coleta local (somente com Docker) ---
+    - name: Listar containers (todos os estados)
+      ansible.builtin.command: >-
+        docker ps -a --format
+        '{{ '{{' }}.Names}}\t{{ '{{' }}.Image}}\t{{ '{{' }}.Status}}\t{{ '{{' }}.Ports}}'
+      register: docker_containers
+      when: docker_version.rc == 0
+      changed_when: false
+
+    - name: Listar redes locais
+      ansible.builtin.command: >-
+        docker network ls --format
+        '{{ '{{' }}.Name}}\t{{ '{{' }}.Driver}}\t{{ '{{' }}.Scope}}'
+      register: docker_networks
+      when: docker_version.rc == 0
+      changed_when: false
+
+    - name: Listar volumes
+      ansible.builtin.command: >-
+        docker volume ls --format
+        '{{ '{{' }}.Name}}\t{{ '{{' }}.Driver}}'
+      register: docker_volumes
+      when: docker_version.rc == 0
+      changed_when: false
+
+    - name: Listar imagens locais
+      ansible.builtin.command: >-
+        docker images --format
+        '{{ '{{' }}.Repository}}:{{ '{{' }}.Tag}}\t{{ '{{' }}.Size}}\t{{ '{{' }}.CreatedSince}}'
+      register: docker_images
+      when: docker_version.rc == 0
+      changed_when: false
+
+    # --- Classificação do papel no Swarm ---
+    # A expressão fica em UMA linha de propósito: scalar dobrado (>) introduz
+    # espaço no fim da string e faz todo manager cair em "standalone".
+    - name: Registrar estado persistente do Swarm
+      ansible.builtin.set_fact:
+        swarm_estado: "{{ (docker_version.rc != 0) | ternary('sem-docker', (docker_info.Swarm.LocalNodeState == 'active' and docker_info.Swarm.ControlAvailable) | ternary('manager', (docker_info.Swarm.LocalNodeState == 'active') | ternary('worker', 'standalone'))) }}"
+
+    # --- Relatório único por host ---
+    - name: Gerar relatório completo do servidor
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../relatorios/servidor-{{ inventory_hostname }}.txt"
+        mode: "0640"
+        content: |
+          ========================================
+          SERVIDOR: {{ inventory_hostname }}
+          REGIÃO: {{ regiao }}
+          ========================================
+
+          [SO]
+          Distribuição: {{ ansible_facts['distribution'] }} {{ ansible_facts['distribution_version'] }}
+          Codinome: {{ ansible_facts['distribution_release'] }}
+          Kernel: {{ ansible_facts['kernel'] }}
+          Arquitetura: {{ ansible_facts['architecture'] }}
+
+          [HARDWARE]
+          CPU: {{ ansible_facts['processor_vcpus'] }} vCPUs
+          Modelo CPU: {{ ansible_facts['processor'][0] if ansible_facts['processor'] | length > 0 else 'N/A' }}
+          Memória Total: {{ (ansible_facts['memtotal_mb'] / 1024) | round(1) }} GB
+          Memória Livre: {{ (ansible_facts['memfree_mb'] / 1024) | round(1) }} GB
+
+          [REDE]
+          Hostname: {{ ansible_facts['hostname'] }}
+          IP Principal: {{ ansible_facts['default_ipv4']['address'] }}
+          Máscara: {{ ansible_facts['default_ipv4']['netmask'] }}
+          Gateway: {{ ansible_facts['default_ipv4']['gateway'] }}
+          Interfaces: {{ ansible_facts['interfaces'] | join(', ') }}
+
+          [DISCO]
+          {% for mount in ansible_facts['mounts'] %}
+          {{ mount.mount }}: {{ (mount.size_total / 1073741824) | round(1) }}GB total, {{ (mount.size_available / 1073741824) | round(1) }}GB livre ({{ mount.fstype }})
+          {% endfor %}
+
+          {% if docker_version.rc == 0 %}
+          [DOCKER]
+          Versão: {{ docker_info.ServerVersion }}
+          Storage Driver: {{ docker_info.Driver }}
+          Docker Root: {{ docker_info.DockerRootDir }}
+          Logging Driver: {{ docker_info.LoggingDriver }}
+          Cgroup Version: {{ docker_info.CgroupVersion }}
+
+          [SWARM]
+          {% if swarm_estado == 'manager' %}
+          MANAGER do Swarm — topologia completa em swarm-topologia.txt
+             Containers avulsos fora do Swarm também rodam aqui (ver abaixo)
+             NodeID: {{ docker_info.Swarm.NodeID }}
+             Nós: {{ docker_info.Swarm.Nodes }}
+             Managers: {{ docker_info.Swarm.Managers }}
+          {% elif swarm_estado == 'worker' %}
+          WORKER do Swarm
+             Comandos de Swarm só rodam no manager
+          {% else %}
+          Docker standalone — NÃO pertence ao Swarm
+          {% endif %}
+
+          [CONTAINERS]
+          Total: {{ docker_info.Containers }}
+          Rodando: {{ docker_info.ContainersRunning }}
+          Pausados: {{ docker_info.ContainersPaused }}
+          Parados: {{ docker_info.ContainersStopped }}
+          Imagens: {{ docker_info.Images }}
+
+          [CONTAINERS LOCAIS]
+          {% if docker_containers.stdout_lines | length > 0 %}
+          {% for c in docker_containers.stdout_lines %}
+          - {{ c }}
+          {% endfor %}
+          {% else %}
+          Nenhum container local.
+          {% endif %}
+
+          [REDES]
+          {% for n in docker_networks.stdout_lines %}
+          - {{ n }}
+          {% endfor %}
+
+          [VOLUMES]
+          {% for v in docker_volumes.stdout_lines %}
+          - {{ v }}
+          {% endfor %}
+
+          [IMAGENS]
+          {% for img in docker_images.stdout_lines %}
+          - {{ img }}
+          {% endfor %}
+          {% else %}
+          [DOCKER]
+          Docker NÃO instalado neste servidor.
+          {% endif %}
+
+          [PACOTES]
+          Total de pacotes: {{ ansible_facts['packages'] | length }}
+          {% for pkg, info in ansible_facts['packages'].items() | sort %}
+          {{ pkg }}={{ info[0]['version'] }}
+          {% endfor %}
+
+# =====================================================
+# PLAY 2 — Topologia do Swarm (somente no manager)
+# =====================================================
+- name: Topologia do Swarm
+  hosts: swarm_manager
+  gather_facts: true
+
+  tasks:
+    - name: Verificar se é manager do Swarm
+      ansible.builtin.command: >-
+        docker info --format
+        '{{ '{{' }}.Swarm.LocalNodeState}} {{ '{{' }}.Swarm.ControlAvailable}}'
+      register: swarm_check
+      changed_when: false
+
+    - name: Encerrar se não for manager
+      ansible.builtin.meta: end_play
+      when: swarm_check.stdout.split()[1] != 'true'
+
+    - name: Listar todos os nós do Swarm
+      ansible.builtin.command: >-
+        docker node ls --format
+        '{{ '{{' }}.Hostname}}\t{{ '{{' }}.ID}}\t{{ '{{' }}.Status}}\t{{ '{{' }}.Availability}}\t{{ '{{' }}.ManagerStatus}}'
+      register: swarm_nodes
+      changed_when: false
+
+    - name: Listar todos os serviços
+      ansible.builtin.command: >-
+        docker service ls --format
+        '{{ '{{' }}.Name}}\t{{ '{{' }}.Replicas}}\t{{ '{{' }}.Image}}\t{{ '{{' }}.Ports}}'
+      register: swarm_services
+      changed_when: false
+
+    - name: Coletar tarefas em execução
+      ansible.builtin.shell: |
+        for svc in $(docker service ls -q); do
+          docker service ps $svc \
+            --format '{{ '{{' }}.Name}}\t{{ '{{' }}.Node}}\t{{ '{{' }}.CurrentState}}\t{{ '{{' }}.Error}}' \
+            --no-trunc 2>/dev/null
+        done
+      register: swarm_tasks
+      changed_when: false
+
+    - name: Listar stacks
+      ansible.builtin.command: >-
+        docker stack ls --format
+        '{{ '{{' }}.Name}}\t{{ '{{' }}.Services}}'
+      register: swarm_stacks
+      changed_when: false
+
+    - name: Listar redes overlay do Swarm
+      # --scope não existe; o filtro correto é --filter scope=swarm
+      ansible.builtin.command: >-
+        docker network ls --filter scope=swarm --format
+        '{{ '{{' }}.Name}}\t{{ '{{' }}.Driver}}\t{{ '{{' }}.Scope}}'
+      register: swarm_networks
+      changed_when: false
+
+    - name: Listar secrets (apenas nomes)
+      ansible.builtin.command: >-
+        docker secret ls --format
+        '{{ '{{' }}.Name}}\t{{ '{{' }}.CreatedAt}}'
+      register: swarm_secrets
+      changed_when: false
+      ignore_errors: true
+
+    - name: Listar configs (apenas nomes)
+      ansible.builtin.command: >-
+        docker config ls --format
+        '{{ '{{' }}.Name}}\t{{ '{{' }}.CreatedAt}}'
+      register: swarm_configs
+      changed_when: false
+      ignore_errors: true
+
+    - name: Gerar relatório consolidado do Swarm
+      ansible.builtin.copy:
+        dest: "{{ playbook_dir }}/../relatorios/swarm-topologia.txt"
+        mode: "0640"
+        content: |
+          ========================================
+          TOPOLOGIA DO DOCKER SWARM
+          Manager: {{ inventory_hostname }}
+          Data: {{ ansible_date_time.iso8601 }}
+          ========================================
+
+          [NÓS DO SWARM]
+          {{ swarm_nodes.stdout }}
+
+          [SERVIÇOS]
+          {{ swarm_services.stdout }}
+
+          [ONDE CADA SERVIÇO ESTÁ RODANDO]
+          {% for line in swarm_tasks.stdout_lines %}
+          {{ line }}
+          {% endfor %}
+
+          [STACKS]
+          {% if swarm_stacks.stdout_lines | length > 0 %}
+          {% for s in swarm_stacks.stdout_lines %}
+          - {{ s }}
+          {% endfor %}
+          {% else %}
+          Nenhuma stack encontrada.
+          {% endif %}
+
+          [REDES OVERLAY]
+          {% for line in swarm_networks.stdout_lines %}
+          {{ line }}
+          {% endfor %}
+
+          [SECRETS]
+          {% for line in swarm_secrets.stdout_lines | default([]) %}
+          {{ line }}
+          {% endfor %}
+
+          [CONFIGS]
+          {% for line in swarm_configs.stdout_lines | default([]) %}
+          {{ line }}
+          {% endfor %}
+
+          [SERVIDORES FORA DO SWARM]
+          {% for host in groups['servers'] %}
+          {% set est = hostvars[host]['swarm_estado'] | default('sem-docker') %}
+          {% if est not in ['manager', 'worker'] %}
+          - {{ host }}: {% if est == 'standalone' %}Docker standalone — containers locais em servidor-{{ host }}.txt{% else %}sem Docker{% endif %}
+          {% endif %}
+          {% endfor %}
+      delegate_to: localhost

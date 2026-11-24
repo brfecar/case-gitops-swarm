@@ -1,0 +1,36 @@
+flowchart LR
+    subgraph BR["América do Sul"]
+        br01["br-01<br/>manager"]
+        br02["br-02<br/>worker"]
+        br03["br-03<br/>standalone"]
+    end
+
+    subgraph US["América do Norte"]
+        us01["us-01<br/>standalone"]
+        us02["us-02<br/>worker"]
+        us03["us-03<br/>worker"]
+    end
+
+    subgraph EU["Europa"]
+        eu01["eu-01<br/>worker"]
+        eu02["eu-02<br/>standalone"]
+    end
+
+    sw["Docker Swarm<br/>1 manager + 4 workers"]
+
+    br01 --- sw
+    br02 --- sw
+    us02 --- sw
+    us03 --- sw
+    eu01 --- sw
+
+    br03 -.->|réplica| us01
+    us02 -->|escrita| us01
+    eu01 -.->|standalone| eu02
+
+    classDef manager fill:#1f6feb,color:#fff
+    classDef worker fill:#238636,color:#fff
+    classDef standalone fill:#6e7681,color:#fff
+    class br01 manager
+    class br02,us02,us03,eu01 worker
+    class br03,us01,eu02 standalone

@@ -1,0 +1,39 @@
+# Inventário real e artefatos gerados nunca entram no repositório
+ansible/inventory.ini
+ansible/inventarios/
+ansible/relatorios/
+ansible/evidencias/
+*.retry
+
+# Segredos e chaves
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa
+id_ed25519
+vault.yml
+secrets.yml
+
+# SO e editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Linguagens / ambiente
+__pycache__/
+*.pyc
+.venv/
+venv/
+node_modules/
+
+# Logs e dumps
+*.log
+core
+core.*
+*.dump
